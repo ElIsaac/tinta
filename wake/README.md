@@ -61,7 +61,7 @@ lo anterior se cumple y el perfil `MiHotspot` ya esta guardado bien.
 ## Instalar
 
 ```sh
-cd ~/spen-mouse/wake
+cd ~/tinta/wake
 # 1. conectate una vez al hotspot del telefono para que quede guardado
 # 2. instala (la interfaz se detecta sola; -i IFACE para forzarla; hasta N SSIDs)
 sudo ./install.sh "MiHotspot"

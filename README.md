@@ -1,4 +1,6 @@
-# spen-mouse
+# TINTA
+
+**T**INTA **I**s **N**ot a **T**ablet **A**pp.
 
 Convierte un teléfono Android con lápiz (probado en un Galaxy S26 Ultra con S Pen) en mouse,
 teclado y **tercer monitor** de una laptop Linux con Hyprland, por la red local, un hotspot o una VPN.
@@ -39,8 +41,8 @@ ventana y el video van además cifrados (ChaCha20-Poly1305). El protocolo está 
 sudo dnf install cargo wtype wf-recorder wl-clipboard iw python3-gobject gtk3 gtk-layer-shell
 
 # 2. Código y receptor
-git clone https://github.com/ElIsaac/spen-mouse ~/spen-mouse
-cd ~/spen-mouse/receiver && cargo build --release
+git clone https://github.com/ElIsaac/tinta ~/tinta
+cd ~/tinta/receiver && cargo build --release
 
 # 3. Permiso para crear dispositivos de entrada virtuales (tu usuario debe estar en el grupo `input`)
 echo 'KERNEL=="uinput", SUBSYSTEM=="misc", GROUP="input", MODE="0660", OPTIONS+="static_node=uinput"' \
@@ -51,7 +53,7 @@ sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=uinput
 sudo firewall-cmd --permanent --add-port=47800/udp --add-port=47800/tcp && sudo firewall-cmd --reload
 
 # 5. Manager: instala el servicio del receptor (arranca al iniciar sesión) y el icono de Waybar
-cd ~/spen-mouse/manager && ./install.sh
+cd ~/tinta/manager && ./install.sh
 ```
 
 Si tu usuario no está en `input`: `sudo usermod -aG input $USER` y vuelve a iniciar sesión.
@@ -60,26 +62,26 @@ Detalles del manager en [`manager/README.md`](manager/README.md).
 
 ## Instalación en el teléfono
 
-Descarga `spen-mouse.apk` de la página de
-[Releases](https://github.com/ElIsaac/spen-mouse/releases) y ábrelo en el teléfono (Android pedirá
+Descarga `tinta.apk` de la página de
+[Releases](https://github.com/ElIsaac/tinta/releases) y ábrelo en el teléfono (Android pedirá
 permitir instalar desde esa fuente). O por cable:
 
 ```sh
-adb install spen-mouse.apk
+adb install tinta.apk
 ```
 
 El APK publicado está firmado con una llave de depuración: sirve para uso personal, no para
 tiendas. Para compilarlo tú (JDK 17 a 21 y el SDK de Android):
 
 ```sh
-cd ~/spen-mouse/android && ./gradlew assembleDebug
+cd ~/tinta/android && ./gradlew assembleDebug
 # app/build/outputs/apk/debug/app-debug.apk
 ```
 
 ## Vincular el teléfono
 
 1. En la laptop, clic en el icono del mouse en Waybar y luego en **Emparejar**. Aparece un QR.
-2. Escanéalo con la cámara del teléfono y abre el enlace con spen-mouse.
+2. Escanéalo con la cámara del teléfono y abre el enlace con la app (se llama "S Pen Mouse" en el teléfono).
    Si la cámara no lo abre, copia la URI que sale bajo el QR y pégala en la app con el botón de
    enlace.
 
@@ -90,7 +92,7 @@ quien lo tenga puede controlar la laptop.
 Sin el manager, lo mismo desde una terminal:
 
 ```sh
-~/spen-mouse/receiver/target/release/spenmouse-receiver pair [--alt IP_DE_LA_VPN]
+~/tinta/receiver/target/release/spenmouse-receiver pair [--alt IP_DE_LA_VPN]
 ```
 
 ## Uso

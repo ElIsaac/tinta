@@ -1,4 +1,4 @@
-# manager: icono de Waybar y popup para spen-mouse
+# manager: icono de Waybar y popup para TINTA
 
 Un icono en Waybar que muestra el estado del receptor y, al hacer clic, un popup para manejarlo
 todo desde la PC: el servicio del receptor, el emparejamiento del teléfono, qué pantalla ve el
@@ -19,8 +19,8 @@ Es un solo script de Python (`spenmouse-manager`, GTK3 + gtk-layer-shell), sin d
 ## Instalar en otra PC
 
 ```sh
-git clone https://github.com/ElIsaac/spen-mouse ~/spen-mouse
-cd ~/spen-mouse/receiver && cargo build --release
+git clone https://github.com/ElIsaac/tinta ~/tinta
+cd ~/tinta/receiver && cargo build --release
 cd ../manager && ./install.sh
 ```
 
