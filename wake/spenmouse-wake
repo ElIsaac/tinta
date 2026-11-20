@@ -1,0 +1,47 @@
+#!/usr/bin/bash
+# spenmouse-wake arm IFACE   arma los disparadores WoWLAN (al aparecer la interfaz y antes de cada suspension)
+# spenmouse-wake hold        corre bajo systemd-inhibit tras cada despertar con la tapa cerrada
+# DRY_RUN=1 solo imprime el comando iw (sirve para probar sin root).
+set -u
+# shellcheck source=/dev/null
+. "${SPENMOUSE_WAKE_CONF:-/etc/spenmouse-wake.conf}"
+
+arm() {
+    local iface=$1 phy args s
+    phy=$(cat "/sys/class/net/$iface/phy80211/name") || return 1
+    args=(magic-packet)
+    [ "$WAKE_ON_DISCONNECT" = 1 ] && args+=(disconnect)
+    # net-detect va al final: su parser consume el resto de los argumentos
+    if [ "${#SSIDS[@]}" -gt 0 ]; then
+        args+=(net-detect interval "$ND_INTERVAL_MS" delay "$ND_DELAY_S" matches)
+        for s in "${SSIDS[@]}"; do args+=(ssid "$s"); done
+    fi
+    printf '+ iw phy %s wowlan enable' "$phy"; printf ' %q' "${args[@]}"; echo
+    [ "${DRY_RUN:-0}" = 1 ] && return 0
+    # mac80211 no le pasa WoWLAN al driver si ninguna interfaz esta arriba
+    ip link set "$iface" up || echo "aviso: no se pudo levantar $iface (rfkill?)" >&2
+    iw phy "$phy" wowlan enable "${args[@]}"
+}
+
+phone_present() {
+    # shortcut: "telefono presente" = conexion TCP de video al receptor; cambiar cuando el receptor tome su propio inhibidor de logind
+    [ -n "$(ss -Htn state established "( sport = :$PORT )")" ]
+}
+
+hold() {
+    local idle=0 t
+    # con la tapa abierta logind no vuelve a suspender: no hace falta inhibidor
+    grep -q closed /proc/acpi/button/lid/*/state 2>/dev/null || return 0
+    while [ "$idle" -lt "$GRACE_S" ]; do
+        t=$SECONDS
+        sleep 10
+        # SECONDS es reloj de pared y sleep no cuenta el tiempo suspendido: un salto = hubo otra suspension, reinicia la gracia
+        if [ $((SECONDS - t)) -gt 20 ] || phone_present; then idle=0; else idle=$((idle + 10)); fi
+    done
+}
+
+case "${1:-}" in
+    arm) arm "${2:?falta IFACE}" ;;
+    hold) hold ;;
+    *) echo "uso: $0 arm IFACE | hold" >&2; exit 2 ;;
+esac

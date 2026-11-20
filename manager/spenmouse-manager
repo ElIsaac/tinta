@@ -1,0 +1,739 @@
+#!/usr/bin/env python3
+"""
+spenmouse-manager: icono de Waybar + popup para manejar spen-mouse en la PC.
+
+    spenmouse-manager             abre/cierra el popup
+    spenmouse-manager --status    JSON para el modulo custom de Waybar
+    spenmouse-manager --selftest  pruebas rapidas sin tocar nada
+
+Maneja el servicio de usuario spenmouse-receiver.service (iniciar, detener,
+arranque al iniciar sesion, que pantalla ve el telefono y su escala), el
+emparejamiento y el despertar por WiFi de ../wake (via pkexec).
+Las opciones del receptor viven en ~/.config/spenmouse/receiver.env, que el
+servicio lee como EnvironmentFile.
+"""
+
+import ipaddress
+import os
+import shlex
+import signal
+import subprocess
+import sys
+
+HERE = os.path.dirname(os.path.realpath(__file__))  # ~/.local/bin/spenmouse-manager es un symlink aqui
+REPO = os.path.dirname(HERE)
+RECEIVER = os.path.join(REPO, "receiver/target/release/spenmouse-receiver")
+WAKE_INSTALL = os.path.join(REPO, "wake/install.sh")
+WAKE_UNINSTALL = os.path.join(REPO, "wake/uninstall.sh")
+WAKE_CONF = "/etc/spenmouse-wake.conf"
+WAKE_VARS = ("ND_INTERVAL_MS", "ND_DELAY_S", "WAKE_ON_DISCONNECT", "GRACE_S", "PORT")
+
+UNIT = "spenmouse-receiver.service"
+RUNTIME = os.environ.get("XDG_RUNTIME_DIR", "/tmp")
+STATUS_FILE = os.path.join(RUNTIME, "spenmouse/status")
+PID_FILE = os.path.join(RUNTIME, "spenmouse-manager.pid")
+OPTS_FILE = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
+                         "spenmouse/receiver.env")
+# SPENMOUSE_ALT (otras IPs de la laptop, separadas por coma) solo lo usa el manager al emparejar
+OPTS_DEFAULT = {"SPENMOUSE_SCREEN": "virtual", "SPENMOUSE_SCALE": "1.5", "SPENMOUSE_ALT": ""}
+MAX_ALT = 4                   # limite de la app del telefono
+
+VIRTUAL_OUTPUT = "spenmouse"  # nombre del monitor virtual que crea el receptor
+WAYBAR_SIGNAL = 11            # debe coincidir con "signal" del modulo en install.sh
+MAX_SSID_BYTES = 32
+POPUP_WIDTH = 460
+POPUP_EDGE_GAP = 8
+QR_MODULE_PX = 4
+REFRESH_S = 2
+ROOT_OUTPUT_LINES = 12
+
+# estado -> (icono Nerd Font, texto)
+STATES = {
+    "stopped":   ("\U000f037e", "Receptor detenido"),
+    "idle":      ("\U000f037d", "En marcha, sin teléfono"),
+    "phone":     ("\U000f0121", "Teléfono conectado"),
+    "streaming": ("\U000f0119", "Transmitiendo pantalla"),
+}
+
+
+# ── estado ───────────────────────────────────────────────────────────────────
+
+def run(*cmd, timeout=15):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, r.stdout.strip()
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return 1, str(e)
+
+
+def systemctl(*args):
+    return run("systemctl", "--user", *args)
+
+
+def read_kv(path):
+    try:
+        with open(path) as f:
+            return dict(line.rstrip("\n").split("=", 1) for line in f if "=" in line)
+    except OSError:
+        return {}
+
+
+def receiver_state():
+    """(estado, ip del telefono, salida transmitida). El archivo de estado queda
+    viejo si el servicio no esta activo, por eso se pregunta primero a systemd."""
+    if systemctl("is-active", UNIT)[1] != "active":
+        return "stopped", "", ""
+    kv = read_kv(STATUS_FILE)
+    phone, stream = kv.get("phone", ""), kv.get("stream", "")
+    return ("streaming" if stream else "phone" if phone else "idle"), phone, stream
+
+
+def describe(state, phone, stream):
+    text = STATES[state][1]
+    if state == "streaming":
+        text += f" ({stream})"
+    if phone:
+        text += f" · {phone}"
+    return text
+
+
+def print_status():
+    import json
+    state, phone, stream = receiver_state()
+    print(json.dumps({"text": STATES[state][0], "class": state,
+                      "tooltip": "spen-mouse: " + describe(state, phone, stream)},
+                     ensure_ascii=False))
+
+
+def poke_waybar():
+    run("pkill", f"-RTMIN+{WAYBAR_SIGNAL}", "-x", "waybar")
+
+
+# ── opciones del receptor ────────────────────────────────────────────────────
+
+def load_opts(path=OPTS_FILE):
+    return {**OPTS_DEFAULT, **{k: v for k, v in read_kv(path).items() if k in OPTS_DEFAULT and v}}
+
+
+def save_opts(changes, path=OPTS_FILE):
+    opts = {**load_opts(path), **changes}
+    screen = opts["SPENMOUSE_SCREEN"]
+    # systemd parte el EnvironmentFile por lineas y el valor va tal cual a ExecStart
+    if not screen or any(c.isspace() or c in "\"'\\$" for c in screen):
+        raise ValueError(f"nombre de salida no válido: {screen!r}")
+    opts["SPENMOUSE_SCALE"] = f"{float(opts['SPENMOUSE_SCALE']):g}"
+    opts["SPENMOUSE_ALT"] = ",".join(str(ipaddress.IPv4Address(a)) for a in split_alt(opts["SPENMOUSE_ALT"]))
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        f.write("".join(f"{k}={opts[k]}\n" for k in OPTS_DEFAULT))
+    os.replace(tmp, path)
+
+
+def split_alt(value):
+    return [a for a in value.split(",") if a]
+
+
+def alt_candidates():
+    """[(ip, interfaz)] de esta maquina que el telefono podria usar ademas de la
+    principal: fuera la de la ruta por defecto (ya va como host), loopback y
+    puentes (docker, libvirt), que no son alcanzables desde fuera."""
+    import json
+    import socket
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("1.1.1.1", 9))  # igual que el receptor: solo elige ruta, no manda nada
+        main = s.getsockname()[0]
+        s.close()
+    except OSError:
+        main = ""
+    found = []
+    try:
+        for iface in json.loads(run("ip", "-j", "-4", "addr", "show")[1]):
+            name = iface["ifname"]
+            if os.path.exists(f"/sys/class/net/{name}/bridge"):
+                continue
+            found += [(a["local"], name) for a in iface["addr_info"]
+                      if a.get("scope") == "global" and a["local"] != main]
+    except (ValueError, KeyError, TypeError):
+        pass
+    return found
+
+
+def outputs():
+    import json
+    try:
+        mons = json.loads(run("hyprctl", "monitors", "-j")[1])
+        return [m["name"] for m in mons if m["name"] != VIRTUAL_OUTPUT]
+    except (ValueError, KeyError, TypeError):
+        return []
+
+
+# ── emparejar ────────────────────────────────────────────────────────────────
+
+def qr_matrix(text):
+    """Convierte el QR de terminal (medios bloques, 2 filas por linea) en una
+    matriz de bool, True = modulo oscuro. La esquina es zona de silencio (clara)."""
+    rows = []
+    for line in text.splitlines():
+        if not line or set(line) - set(" ▀▄█"):
+            continue
+        rows.append([c in "▀█" for c in line])
+        rows.append([c in "▄█" for c in line])
+    if not rows:
+        return []
+    light = rows[0][0]
+    # el QR es cuadrado: con altura impar sobra media fila de relleno al final
+    return [[cell != light for cell in row] for row in rows[:len(rows[0])]]
+
+
+def pairing(alts=()):
+    """(matriz QR, URI, error). La URI lleva la llave: no se guarda ni se registra."""
+    cmd = [RECEIVER, "pair"]
+    for a in alts:
+        cmd += ["--alt", a]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return [], "", str(e)
+    if r.returncode != 0:
+        return [], "", r.stderr.strip() or "falló spenmouse-receiver pair"
+    uri = next((l for l in r.stdout.splitlines() if l.startswith("spenmouse://")), "")
+    return qr_matrix(r.stdout), uri, ""
+
+
+# ── despertar por WiFi ───────────────────────────────────────────────────────
+
+def wake_conf(path=WAKE_CONF):
+    """None si no esta instalado; si no (ssids, {variable: valor}).
+    El archivo lo escribe install.sh con printf %q: solo bash lo lee bien."""
+    if not os.path.isfile(path):
+        return None
+    script = '. "$1" || exit 1; printf "%s\\0" ' + " ".join(f'"${v}"' for v in WAKE_VARS) + ' "${SSIDS[@]}"'
+    r = subprocess.run(["bash", "-c", script, "_", path], capture_output=True, text=True)
+    parts = r.stdout.split("\0")[:-1]
+    if r.returncode != 0 or len(parts) < len(WAKE_VARS):
+        return [], {}
+    n = len(WAKE_VARS)
+    return parts[n:], {k: v for k, v in zip(WAKE_VARS, parts[:n]) if v}
+
+
+def wake_install_cmd(ssids, keep):
+    """Comando exacto que se le muestra al usuario y se ejecuta. `keep` conserva
+    los ajustes de una instalacion anterior (install.sh reescribe todo)."""
+    env = ["env", *[f"{k}={v}" for k, v in keep.items()]] if keep else []
+    return ["pkexec", *env, WAKE_INSTALL, "--", *ssids]
+
+
+def ssid_error(ssid, current):
+    if not ssid:
+        return "Escribe el nombre del hotspot"
+    if len(ssid.encode()) > MAX_SSID_BYTES or "\0" in ssid or "\n" in ssid:
+        return "Un SSID tiene como máximo 32 bytes"
+    if ssid in current:
+        return "Ese SSID ya está en la lista"
+    return None
+
+
+def wifi():
+    """(interfaz, MAC actual, SSID actual) de la primera interfaz WiFi."""
+    try:
+        for iface in sorted(os.listdir("/sys/class/net")):
+            if os.path.exists(f"/sys/class/net/{iface}/phy80211"):
+                with open(f"/sys/class/net/{iface}/address") as f:
+                    mac = f.read().strip()
+                link = run("iw", "dev", iface, "link")[1]
+                ssid = next((l.split("SSID:", 1)[1].strip() for l in link.splitlines() if "SSID:" in l), "")
+                return iface, mac, ssid
+    except OSError:
+        pass
+    return "", "", ""
+
+
+def saved_wifi():
+    out = run("nmcli", "-t", "-f", "TYPE,NAME", "connection", "show")[1]
+    return sorted(l.split(":", 1)[1].replace("\\:", ":") for l in out.splitlines()
+                  if l.startswith("802-11-wireless:"))
+
+
+# ── popup ────────────────────────────────────────────────────────────────────
+
+# Misma paleta y clases que waybar-monitor-manager (Everforest)
+CSS = b"""
+window#spenmouse-manager { background: transparent; }
+box.popup {
+    background: #2d353b;
+    color: #d3c6aa;
+    border: 2px solid #a7c080;
+    border-radius: 12px;
+    padding: 14px;
+    font-family: "JetBrainsMono Nerd Font", monospace;
+    font-size: 13px;
+}
+.title { font-weight: bold; font-size: 15px; color: #a7c080; }
+.subtitle { color: #859289; font-size: 11px; }
+.section { font-weight: bold; color: #7fbbb3; margin-top: 6px; }
+.btn {
+    background: #343f44;
+    color: #d3c6aa;
+    border: 1px solid #475258;
+    border-radius: 8px;
+    padding: 4px 10px;
+}
+.btn:hover { background: #3d484d; border-color: #a7c080; }
+.btn:disabled { opacity: 0.45; }
+.popup spinbutton, .popup entry, .popup combobox button {
+    background: #232a2e; color: #d3c6aa; border-radius: 6px;
+}
+.popup checkbutton { color: #d3c6aa; }
+.apply {
+    background: #a7c080; color: #2d353b; font-weight: bold;
+    border-radius: 8px; padding: 4px 14px;
+}
+.apply:hover { background: #b9d197; }
+.apply:disabled { opacity: 0.45; }
+.close { background: transparent; color: #859289; border: none; }
+.error { color: #e67e80; font-size: 12px; }
+.mono { font-size: 11px; color: #d3c6aa; }
+.confirm { background: #232a2e; border-radius: 8px; padding: 8px; }
+"""
+
+
+def run_popup():
+    import json
+    import gi
+    gi.require_version("Gtk", "3.0")
+    gi.require_version("GtkLayerShell", "0.1")
+    from gi.repository import Gtk, Gdk, GLib, GtkLayerShell
+
+    provider = Gtk.CssProvider()
+    provider.load_from_data(CSS)
+    Gtk.StyleContext.add_provider_for_screen(
+        Gdk.Screen.get_default(), provider, Gtk.STYLE_PROVIDER_PRIORITY_USER)
+
+    win = Gtk.Window()
+    win.set_name("spenmouse-manager")
+    win.set_title("spenmouse-manager")
+    GtkLayerShell.init_for_window(win)
+    GtkLayerShell.set_namespace(win, "spenmouse-manager")
+    GtkLayerShell.set_layer(win, GtkLayerShell.Layer.OVERLAY)
+    GtkLayerShell.set_keyboard_mode(win, GtkLayerShell.KeyboardMode.ON_DEMAND)
+    GtkLayerShell.set_anchor(win, GtkLayerShell.Edge.TOP, True)
+    GtkLayerShell.set_anchor(win, GtkLayerShell.Edge.LEFT, True)
+
+    # Abre justo debajo del cursor (que esta sobre el icono de Waybar)
+    try:
+        cur = json.loads(run("hyprctl", "cursorpos", "-j")[1])
+        mon = next(m for m in json.loads(run("hyprctl", "monitors", "-j")[1]) if m["focused"])
+        width = round(mon["width"] / (mon.get("scale") or 1.0))
+        left = min(max(cur["x"] - mon["x"] - POPUP_WIDTH // 2, POPUP_EDGE_GAP),
+                   width - POPUP_WIDTH - POPUP_EDGE_GAP)
+    except Exception:
+        left = POPUP_EDGE_GAP
+    GtkLayerShell.set_margin(win, GtkLayerShell.Edge.LEFT, max(left, POPUP_EDGE_GAP))
+    GtkLayerShell.set_margin(win, GtkLayerShell.Edge.TOP, POPUP_EDGE_GAP)
+
+    def close(*_):
+        Gtk.main_quit()
+
+    win.connect("key-press-event", lambda _w, ev: ev.keyval == Gdk.KEY_Escape and close())
+    win.connect("destroy", close)
+    try:
+        gi.require_version("GLibUnix", "2.0")
+        from gi.repository import GLibUnix
+        GLibUnix.signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, close)
+    except (ValueError, ImportError):
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, close)
+
+    def label(text="", cls=None, wrap=False, selectable=False):
+        w = Gtk.Label(label=text, xalign=0)
+        if cls:
+            w.get_style_context().add_class(cls)
+        if wrap:
+            w.set_line_wrap(True)
+            w.set_line_wrap_mode(2)  # Pango.WrapMode.WORD_CHAR: la URI no tiene espacios
+            w.set_max_width_chars(1)
+        w.set_selectable(selectable)
+        return w
+
+    def button(text, on_click, cls="btn"):
+        w = Gtk.Button(label=text)
+        w.get_style_context().add_class(cls)
+        w.connect("clicked", lambda _b: on_click())
+        return w
+
+    def row(*widgets, expand=0):
+        box = Gtk.Box(spacing=8)
+        for i, w in enumerate(widgets):
+            box.pack_start(w, i == expand, i == expand, 0)
+        return box
+
+    root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+    root.get_style_context().add_class("popup")
+    root.set_size_request(POPUP_WIDTH, -1)
+    win.add(root)
+
+    def add(w):
+        root.pack_start(w, False, False, 0)
+        return w
+
+    add(row(label(f"{STATES['idle'][0]}  spen-mouse", "title"), button("✕", close, "close")))
+    add(label("El teléfono como ratón, teclado y pantalla de esta PC", "subtitle"))
+
+    # ── Receptor ──
+    add(label("Receptor", "section"))
+    state_lbl = label()
+    current = {"state": "stopped"}
+
+    def act(*args):
+        systemctl(*args)
+        refresh()
+        poke_waybar()
+
+    btn_toggle = button("", lambda: act("stop" if current["state"] != "stopped" else "start", UNIT))
+    add(row(state_lbl, btn_toggle, button("Reiniciar", lambda: act("restart", UNIT))))
+    autostart = Gtk.CheckButton(label="Arrancar al iniciar sesión")
+    autostart.set_active(systemctl("is-enabled", UNIT)[1] == "enabled")
+    autostart.connect("toggled", lambda b: systemctl("enable" if b.get_active() else "disable", UNIT))
+    add(autostart)
+
+    # ── Teléfono ──
+    add(label("Teléfono", "section"))
+    phone_lbl = label()
+    pair_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+    pair_box.set_no_show_all(True)
+
+    def toggle_pair():
+        if pair_box.get_visible():
+            for child in pair_box.get_children():
+                child.destroy()  # no dejar la llave en pantalla ni en memoria del widget
+            pair_box.hide()
+            btn_pair.set_label("Emparejar")
+            return
+        matrix, uri, err = pairing(split_alt(load_opts()["SPENMOUSE_ALT"]))
+        if err or not matrix:
+            pair_box.add(label(err or "No se pudo leer el QR", "error", wrap=True))
+        else:
+            side = len(matrix[0]) * QR_MODULE_PX
+            area = Gtk.DrawingArea()
+            area.set_size_request(side, len(matrix) * QR_MODULE_PX)
+            area.set_halign(Gtk.Align.CENTER)
+
+            def draw(_w, cr):
+                cr.set_source_rgb(1, 1, 1)
+                cr.paint()
+                cr.set_source_rgb(0, 0, 0)
+                for y, line in enumerate(matrix):
+                    for x, dark in enumerate(line):
+                        if dark:
+                            cr.rectangle(x * QR_MODULE_PX, y * QR_MODULE_PX, QR_MODULE_PX, QR_MODULE_PX)
+                cr.fill()
+            area.connect("draw", draw)
+            pair_box.add(area)
+            pair_box.add(label("Escanéalo con la app. Contiene la llave: no lo compartas.", "subtitle"))
+            pair_box.add(label(uri, "mono", wrap=True, selectable=True))
+        pair_box.show()
+        for child in pair_box.get_children():
+            child.show()
+        btn_pair.set_label("Ocultar")
+
+    btn_pair = button("Emparejar", toggle_pair)
+    add(row(phone_lbl, btn_pair))
+    add(pair_box)
+
+    # Otras direcciones (VPN): van dentro del QR como --alt
+    add(label("Otras direcciones de esta PC para el teléfono (VPN)", "subtitle"))
+    alt_box = add(Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2))
+    alt_entry = Gtk.Entry()
+    alt_entry.set_placeholder_text("Otra IPv4, p. ej. la de la VPN")
+    alt_err = label(cls="error")
+    alt_err.set_no_show_all(True)
+    alt_checks = []
+
+    def save_alt(changed=None):
+        chosen = [ip for ip, check in alt_checks if check.get_active()]
+        if len(chosen) > MAX_ALT:
+            changed.set_active(False)  # vuelve a entrar aqui ya con una menos y guarda
+            alt_err.set_text(f"La app acepta {MAX_ALT} direcciones como máximo")
+            alt_err.show()
+            return
+        alt_err.hide()
+        save_opts({"SPENMOUSE_ALT": ",".join(chosen)})
+
+    def add_alt_check(ip, iface, active):
+        check = Gtk.CheckButton(label=f"{ip}  ({iface})" if iface else ip)
+        check.set_active(active)
+        check.connect("toggled", save_alt)
+        alt_checks.append((ip, check))
+        alt_box.add(check)
+        check.show()
+
+    def add_alt():
+        try:
+            ip = str(ipaddress.IPv4Address(alt_entry.get_text().strip()))
+        except ValueError:
+            alt_err.set_text("Escribe una dirección IPv4, p. ej. 100.64.1.2")
+            alt_err.show()
+            return
+        alt_entry.set_text("")
+        match = next((check for known, check in alt_checks if known == ip), None)
+        if match:
+            match.set_active(True)
+        else:
+            add_alt_check(ip, "", False)
+            alt_checks[-1][1].set_active(True)  # pasa por save_alt y su limite
+
+    saved_alt = split_alt(load_opts()["SPENMOUSE_ALT"])
+    candidates = alt_candidates()
+    for ip, iface in candidates:
+        add_alt_check(ip, iface, ip in saved_alt)
+    for ip in saved_alt:
+        if ip not in [c[0] for c in candidates]:
+            add_alt_check(ip, "", True)
+    add(row(alt_entry, button("Agregar", add_alt)))
+    add(alt_err)
+    add(label(f"Viajan dentro del QR: después de cambiarlas hay que emparejar otra vez. "
+              f"La app acepta {MAX_ALT} como máximo. En casa y con el hotspot no hacen "
+              f"falta: ahí el teléfono encuentra la PC solo.", "subtitle", wrap=True))
+
+    # ── Pantalla ──
+    add(label("Pantalla", "section"))
+    opts = load_opts()
+    screen = Gtk.ComboBoxText()
+    screen.append("virtual", "Tercer monitor virtual")
+    screen.append("focused", "Espejo del monitor enfocado")
+    names = outputs()
+    if opts["SPENMOUSE_SCREEN"] not in ("virtual", "focused", *names):
+        names.append(opts["SPENMOUSE_SCREEN"])
+    for name in names:
+        screen.append(name, f"Espejo de {name}")
+    screen.set_active_id(opts["SPENMOUSE_SCREEN"])
+    scale = Gtk.SpinButton.new_with_range(0.5, 4, 0.25)
+    scale.set_digits(2)
+    try:
+        scale.set_value(float(opts["SPENMOUSE_SCALE"]))
+    except ValueError:
+        scale.set_value(float(OPTS_DEFAULT["SPENMOUSE_SCALE"]))
+    scale.set_tooltip_text("Escala del monitor virtual")
+    screen.connect("changed", lambda c: scale.set_sensitive(c.get_active_id() == "virtual"))
+    scale.set_sensitive(screen.get_active_id() == "virtual")
+    screen_err = label(cls="error")
+    screen_err.set_no_show_all(True)
+
+    def apply_screen():
+        try:
+            save_opts({"SPENMOUSE_SCREEN": screen.get_active_id(), "SPENMOUSE_SCALE": scale.get_value()})
+        except (ValueError, OSError) as e:
+            screen_err.set_text(str(e))
+            screen_err.show()
+            return
+        screen_err.hide()
+        act("try-restart", UNIT)  # un receptor detenido se queda detenido
+
+    add(row(screen, label("Escala", "subtitle"), scale, button("Aplicar", apply_screen, "apply")))
+    add(label("Aplicar reinicia el receptor; el teléfono se reconecta solo.", "subtitle"))
+    add(screen_err)
+
+    # ── Despertar ──
+    add(label("Despertar", "section"))
+    add(label("Prender el hotspot del teléfono despierta la laptop suspendida; "
+              "en la misma red, un paquete WoL.", "subtitle", wrap=True))
+    wake_lbl = label()
+    add(wake_lbl)
+    ssid_box = add(Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4))
+    ssid_entry = Gtk.ComboBoxText.new_with_entry()
+    ssid_entry.get_child().set_placeholder_text("SSID del hotspot")
+    for name in saved_wifi():
+        ssid_entry.append_text(name)
+    wake_err = label(cls="error")
+    wake_err.set_no_show_all(True)
+    wake = {"installed": None, "ssids": [], "keep": {}}
+
+    def add_ssid():
+        ssid = ssid_entry.get_active_text() or ""
+        err = ssid_error(ssid, wake["ssids"])
+        wake_err.set_text(err or "")
+        wake_err.set_visible(bool(err))
+        if not err:
+            wake["ssids"].append(ssid)
+            ssid_entry.get_child().set_text("")
+            draw_wake()
+
+    def remove_ssid(ssid):
+        wake["ssids"].remove(ssid)
+        draw_wake()
+
+    add(row(ssid_entry, button("Agregar", add_ssid)))
+    add(wake_err)
+    iface, mac, ssid_now = wifi()
+    add(label(f"MAC de {iface} en «{ssid_now}»: {mac}" if ssid_now else
+              f"MAC de {iface} (sin red): {mac}" if iface else "No hay interfaz WiFi",
+              "subtitle", selectable=True))
+    add(label("La MAC cambia con cada red; es la que usa el paquete WoL en esta.", "subtitle"))
+
+    btn_install = button("", lambda: ask_root(wake_install_cmd(wake["ssids"], wake["keep"])), "apply")
+    btn_uninstall = button("Desinstalar", lambda: ask_root(["pkexec", WAKE_UNINSTALL]))
+    add(row(label(), btn_install, btn_uninstall))
+
+    def load_wake():
+        conf = wake_conf()
+        wake["installed"] = None if conf is None else list(conf[0])
+        wake["ssids"], wake["keep"] = (list(conf[0]), conf[1]) if conf else ([], {})
+        draw_wake()
+
+    def draw_wake():
+        installed = wake["installed"]
+        wake_lbl.set_text("Instalado" + ("" if wake["ssids"] or installed else " (solo paquete WoL)")
+                          if installed is not None else "No instalado")
+        for child in ssid_box.get_children():
+            child.destroy()
+        for ssid in wake["ssids"]:
+            unsaved = installed is None or ssid not in installed
+            ssid_box.add(row(label(f"󰖩  {ssid}" + ("  (sin aplicar)" if unsaved else "")),
+                             button("✕", lambda s=ssid: remove_ssid(s), "close")))
+        ssid_box.show_all()
+        btn_install.set_label("Instalar" if installed is None else "Aplicar cambios")
+        btn_install.set_sensitive(installed is None or installed != wake["ssids"])
+        btn_uninstall.set_sensitive(installed is not None)
+
+    # Acciones de root: se muestra el comando exacto y solo corre al confirmar
+    confirm = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+    confirm.get_style_context().add_class("confirm")
+    confirm.set_no_show_all(True)
+    confirm_cmd = label(cls="mono", wrap=True, selectable=True)
+    pending = {"cmd": None}
+    root_out = label(cls="mono", wrap=True, selectable=True)
+    root_out.set_no_show_all(True)
+
+    def ask_root(cmd):
+        pending["cmd"] = cmd
+        confirm_cmd.set_text(shlex.join(cmd))
+        root_out.hide()
+        confirm.show_all()
+        confirm.show()
+
+    def run_root():
+        cmd = pending["cmd"]
+        confirm.hide()
+        root_out.set_text("Esperando la autorización…")
+        root_out.show()
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        except OSError as e:
+            root_out.set_text(str(e))
+            return
+
+        def done():
+            if proc.poll() is None:
+                return True
+            out = proc.stdout.read().strip().splitlines()
+            head = {0: "Listo.", 126: "Cancelado: no se autorizó.",
+                    127: "No se pudo autenticar."}.get(proc.returncode, f"Falló (código {proc.returncode}).")
+            root_out.set_text("\n".join([head, *out[-ROOT_OUTPUT_LINES:]]))
+            load_wake()
+            return False
+        GLib.timeout_add(300, done)
+
+    confirm.add(label("Se ejecutará como administrador (pedirá tu contraseña):", "subtitle"))
+    confirm.add(confirm_cmd)
+    confirm.add(row(label(), button("Ejecutar", run_root, "apply"), button("Cancelar", confirm.hide)))
+    add(confirm)
+    add(root_out)
+
+    def refresh():
+        state, phone, stream = receiver_state()
+        current["state"] = state
+        state_lbl.set_text(f"{STATES[state][0]}  {STATES[state][1]}" + (f" ({stream})" if stream else ""))
+        btn_toggle.set_label("Iniciar" if state == "stopped" else "Detener")
+        phone_lbl.set_text(f"Conectado · {phone}" if phone else "Sin conectar")
+        return True
+
+    refresh()
+    load_wake()
+    GLib.timeout_add_seconds(REFRESH_S, refresh)
+    win.show_all()
+    Gtk.main()
+
+
+# ── toggle (un clic abre, el siguiente cierra) ───────────────────────────────
+
+def toggle_existing():
+    try:
+        with open(PID_FILE) as f:
+            pid = int(f.read().strip())
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            if os.path.basename(sys.argv[0]).encode() not in f.read():
+                return False
+        os.kill(pid, signal.SIGTERM)
+        return True
+    except (FileNotFoundError, ValueError, ProcessLookupError, PermissionError):
+        return False
+
+
+# ── pruebas ──────────────────────────────────────────────────────────────────
+
+def selftest():
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "x/receiver.env")
+        assert load_opts(p) == OPTS_DEFAULT
+        save_opts({"SPENMOUSE_SCREEN": "HDMI-A-1", "SPENMOUSE_SCALE": 2.0}, p)
+        save_opts({"SPENMOUSE_ALT": "100.64.0.7,10.8.0.2"}, p)  # no pisa pantalla ni escala
+        assert load_opts(p) == {"SPENMOUSE_SCREEN": "HDMI-A-1", "SPENMOUSE_SCALE": "2",
+                                "SPENMOUSE_ALT": "100.64.0.7,10.8.0.2"}
+        assert split_alt(load_opts(p)["SPENMOUSE_ALT"]) == ["100.64.0.7", "10.8.0.2"]
+        for bad in ({"SPENMOUSE_SCREEN": ""}, {"SPENMOUSE_SCREEN": "a b"}, {"SPENMOUSE_SCREEN": "x$y"},
+                    {"SPENMOUSE_ALT": "1.2.3"}, {"SPENMOUSE_ALT": "a;b"}):
+            try:
+                save_opts(bad, p)
+                raise AssertionError(bad)
+            except ValueError:
+                pass
+        save_opts({"SPENMOUSE_ALT": ""}, p)
+        assert split_alt(load_opts(p)["SPENMOUSE_ALT"]) == []
+        conf = os.path.join(d, "wake.conf")
+        with open(conf, "w") as f:
+            f.write("SSIDS=(Mi\\ Hotspot\\ 5G $'caf\\303\\251' )\nND_INTERVAL_MS=20000\nGRACE_S=60\n")
+        assert wake_conf(conf) == (["Mi Hotspot 5G", "café"],
+                                   {"ND_INTERVAL_MS": "20000", "GRACE_S": "60"}), wake_conf(conf)
+        assert wake_conf(os.path.join(d, "nope")) is None
+        status = os.path.join(d, "status")
+        with open(status, "w") as f:
+            f.write("phone=192.168.0.8\nstream=\n")
+        assert read_kv(status) == {"phone": "192.168.0.8", "stream": ""}
+    assert wake_install_cmd(["a b", "-x"], {}) == ["pkexec", WAKE_INSTALL, "--", "a b", "-x"]
+    assert wake_install_cmd([], {"PORT": "1"})[:3] == ["pkexec", "env", "PORT=1"]
+    assert ssid_error("", []) and ssid_error("x" * 33, []) and ssid_error("a", ["a"])
+    assert ssid_error("MiHotspot", []) is None
+    # QR con polaridad invertida (claro = bloque lleno) y altura impar
+    want = [[False] * 3, [False] * 3, [False, True, False]]
+    assert qr_matrix("███\n█▄█\n▀▀▀\n\nspenmouse://x") == want
+    assert qr_matrix("   \n ▀ \n") == want
+    assert qr_matrix("sin qr") == []
+    assert describe("streaming", "1.2.3.4", "spenmouse") == "Transmitiendo pantalla (spenmouse) · 1.2.3.4"
+    print("ok")
+
+
+def main():
+    arg = sys.argv[1] if len(sys.argv) > 1 else ""
+    if arg == "--status":
+        return print_status()
+    if arg == "--selftest":
+        return selftest()
+    if arg:
+        sys.exit(__doc__.strip())
+    if toggle_existing():
+        return
+    with open(PID_FILE, "w") as f:
+        f.write(str(os.getpid()))
+    try:
+        run_popup()
+    finally:
+        try:
+            os.remove(PID_FILE)
+        except FileNotFoundError:
+            pass
+
+
+if __name__ == "__main__":
+    main()

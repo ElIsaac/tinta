@@ -1,0 +1,10 @@
+[Unit]
+Description=spen-mouse: no re-suspender por tapa cerrada mientras el telefono conecta o esta conectado
+# After+WantedBy=suspend.target: arranca al volver de la suspension.
+After=suspend.target
+
+[Service]
+ExecStart=/usr/bin/systemd-inhibit --what=handle-lid-switch --mode=block --who=spenmouse-wake "--why=telefono conectando o conectado" /usr/local/sbin/spenmouse-wake hold
+
+[Install]
+WantedBy=suspend.target

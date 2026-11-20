@@ -1,0 +1,15 @@
+[Unit]
+Description=spen-mouse: armar WoWLAN (magic packet + net-detect) en %I
+# Corre cuando aparece la interfaz (arranque, recarga del driver) para que NetworkManager
+# vea WoWLAN activo y no desconecte el WiFi al suspender, y otra vez justo antes de cada
+# suspension (despues de que NetworkManager ya hizo lo suyo) por si algo lo borro.
+After=sys-subsystem-net-devices-%i.device
+Before=sleep.target
+
+[Service]
+Type=oneshot
+TimeoutStartSec=15
+ExecStart=/usr/local/sbin/spenmouse-wake arm %I
+
+[Install]
+WantedBy=sleep.target sys-subsystem-net-devices-%i.device

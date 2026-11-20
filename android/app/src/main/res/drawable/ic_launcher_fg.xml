@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="108dp" android:height="108dp" android:viewportWidth="108" android:viewportHeight="108">
+    <!-- lapiz en diagonal -->
+    <path android:pathData="M62,30 L78,46 L50,74 L32,78 L36,60 Z" android:fillColor="#FFFFFFFF" />
+    <path android:pathData="M36,60 L50,74" android:strokeColor="#FF4F46E5" android:strokeWidth="3" android:strokeLineCap="round" />
+    <path android:pathData="M56,36 L72,52" android:strokeColor="#FF4F46E5" android:strokeWidth="3" android:strokeLineCap="round" />
+    <!-- puntero -->
+    <path android:pathData="M58,56 L58,82 L64,76 L69,86 L74,84 L69,74 L77,74 Z" android:fillColor="#FF141821" android:strokeColor="#FFFFFFFF" android:strokeWidth="2.5" android:strokeLineJoin="round" />
+</vector>
