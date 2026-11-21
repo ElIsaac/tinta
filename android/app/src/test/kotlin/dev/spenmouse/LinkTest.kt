@@ -4,7 +4,11 @@ import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
 import java.net.SocketTimeoutException
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import javax.crypto.Cipher
 import javax.crypto.Mac
+import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
@@ -103,6 +107,53 @@ class LinkTest {
             if (p[16].toInt() == 0) idle++
         }
         assertEquals(3, idle)
+        sock.close()
+    }
+
+    private fun wsList(seq: Int, text: String): ByteArray {
+        val plain = text.toByteArray()
+        val out = ByteArray(16 + plain.size + AEAD_TAG)
+        out[0] = 0x53; out[1] = 0x4D; out[2] = 1; out[3] = 7
+        for (i in 0..3) out[4 + i] = (seq ushr (24 - 8 * i)).toByte()
+        for (i in 0..7) out[8 + i] = (session ushr (56 - 8 * i)).toByte()
+        newAead().run {
+            init(
+                Cipher.ENCRYPT_MODE,
+                SecretKeySpec(deriveKey(key, "spenmouse ws"), "ChaCha20"),
+                IvParameterSpec(out.copyOfRange(8, 16) + out.copyOfRange(4, 8)),
+            )
+            updateAAD(out, 0, 16)
+            doFinal(plain, 0, plain.size, out, 16)
+        }
+        return out
+    }
+
+    @Test
+    fun imeEvents() {
+        val ime = ArrayList<Boolean>()
+        val workspaces = ArrayList<String>()
+        val latch = CountDownLatch(2)
+        val link = Link(
+            Pairing("127.0.0.1", sock.localPort, "000102030405060708090a0b0c0d0e0f", "t"),
+            onWorkspaces = { synchronized(workspaces) { workspaces.add(it) } },
+            onIme = {
+                synchronized(ime) { ime.add(it) }
+                latch.countDown()
+            },
+        ) {}
+        link.padW = 1500
+        link.padH = 700
+        link.start()
+
+        assertEquals(1, next(2000)!![3].toInt())
+        state(2000)!! // asegura que Link ya proceso WELCOME y tiene session activa
+        wsList(1, "ime\t1\n").let { sock.send(DatagramPacket(it, it.size, pkt.socketAddress)) }
+        wsList(2, "ime\t0\n").let { sock.send(DatagramPacket(it, it.size, pkt.socketAddress)) }
+
+        assertTrue("onIme debe recibir ambos eventos", latch.await(2, TimeUnit.SECONDS))
+        assertEquals(listOf(true, false), synchronized(ime) { ime.toList() })
+        assertTrue("ime no debe invocar onWorkspaces", synchronized(workspaces) { workspaces.isEmpty() })
+        link.stop()
         sock.close()
     }
 }

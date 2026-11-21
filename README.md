@@ -60,6 +60,52 @@ Si tu usuario no está en `input`: `sudo usermod -aG input $USER` y vuelve a ini
 
 Detalles del manager en [`manager/README.md`](manager/README.md).
 
+## Instalación en macOS
+
+**Requisitos**
+
+- macOS 13 (Ventura) o más reciente (probado en Apple Silicon).
+- Command Line Tools de Xcode (`xcode-select --install`) y Rust (`cargo`).
+
+**Compilación**
+
+```sh
+git clone https://github.com/ElIsaac/tinta ~/tinta
+cd ~/tinta/receiver && cargo build --release
+```
+
+**Permisos**
+
+En **Ajustes del Sistema → Privacidad y seguridad**, otorga estos permisos a la terminal desde la que ejecutas el receptor (o a `~/Applications/Tinta Receiver.app` si usas el servicio en segundo plano):
+
+- **Accesibilidad**: necesario para mover el puntero, teclear y mover ventanas entre pantallas.
+- **Grabación de pantalla**: necesario para capturar el escritorio, una ventana o el monitor virtual con ScreenCaptureKit.
+
+**Ejecución, servicio y emparejamiento**
+
+```sh
+# Emparejar (imprime el QR y la URI; usa --alt IP_DE_LA_VPN si aplica)
+~/tinta/receiver/target/release/spenmouse-receiver pair
+
+# Iniciar el receptor a mano (UDP y TCP en el puerto 47800 por defecto)
+~/tinta/receiver/target/release/spenmouse-receiver
+
+# O instalar el servicio en segundo plano al iniciar sesión (LaunchAgent)
+cd ~/tinta/macos && ./install.sh
+
+# O instalarlo en modo ventana única adaptada al teléfono
+cd ~/tinta/macos && ./install.sh --screen window
+```
+
+Detalles del servicio en segundo plano, opciones (`--screen` con `main`, `virtual`, `focused`, `window` o nombre/ID, `--scale`, `--port`), logs y
+prevención de suspensión en [`macos/README.md`](macos/README.md).
+
+**Límites conocidos en macOS**
+
+- No incluye el manager de escritorio (Waybar) ni el despertar por WiFi (`wake/`).
+- La vista de ventanas agrupa y presta ventanas por pantalla (usando la API de Accesibilidad), no por Spaces de Mission Control.
+- Las ventanas en pantalla completa nativa de macOS o protegidas contra captura pueden no moverse ni capturarse.
+
 ## Instalación en el teléfono
 
 Descarga `tinta.apk` de la página de

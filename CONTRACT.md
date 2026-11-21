@@ -188,6 +188,9 @@ convertida por el teclado de Samsung) y el receptor lo teclea en la ventana enfo
   segundo el HELLO tambien por broadcast (la IP de la laptop cambia de una red a otra; vale la
   direccion de origen del WELCOME) y un paquete magico (6 x FF + MAC x 16, UDP puerto 9, broadcast)
   por cada MAC que conoce. Ver `wake/README.md` para el lado de la laptop.
+- Teclado automatico: `ime TAB 1` (opcional, laptop -> telefono via WSLIST) indica que un clic o
+  toque enfoco un campo de texto editable en la laptop para que el telefono abra su teclado
+  automaticamente.
 - **WSLIST (type 7, laptop -> telefono, UDP, 16 + n + 16 bytes):** cabecera (con `seq` = contador
   propio del receptor), `session` u64 y ChaCha20-Poly1305 con llave
   `Kws = HMAC-SHA256(K, "spenmouse ws")`, nonce = `session` (8) + `seq` (4), AAD = los primeros 16

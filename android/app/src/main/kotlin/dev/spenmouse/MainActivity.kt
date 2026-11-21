@@ -59,6 +59,7 @@ class MainActivity : Activity() {
     private lateinit var showBar: View
     private lateinit var pad: PadView
     private lateinit var field: KeyField
+    private lateinit var keyboardToggle: IconToggle
     private lateinit var video: SurfaceView
     private lateinit var stage: FrameLayout
     private var screen: Screen? = null
@@ -67,6 +68,10 @@ class MainActivity : Activity() {
     private var vw = 0
     private var vh = 0
     private var imeH = 0
+    private var imeWasOpen = false
+    private var lastTapX = 0.5f
+    private var lastTapY = 0.5f
+    private var autoZoomPending = false
     private val resize = Runnable { if (screen != null) syncScreen() }
     private var mobile = false
     private var clipStamp = 0L // marca de tiempo del portapapeles del telefono ya sincronizado
@@ -133,10 +138,11 @@ class MainActivity : Activity() {
         fun LinearLayout.add(v: View) = addView(v, LinearLayout.LayoutParams(target, target).apply { marginStart = gap })
 
         // Fila A: estado y modos. Fila B: teclas. Una al lado de la otra si hay ancho, apiladas si no.
+        keyboardToggle = IconToggle(this@MainActivity, R.drawable.ic_keyboard, "Teclado", ::showKeyboard)
         val rowA = LinearLayout(this).apply {
             gravity = Gravity.CENTER_VERTICAL
             addView(status, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-            add(IconToggle(this@MainActivity, R.drawable.ic_keyboard, "Teclado", ::showKeyboard))
+            add(keyboardToggle)
             add(IconToggle(this@MainActivity, R.drawable.ic_screen, "Pantalla", ::showScreen))
             add(IconToggle(this@MainActivity, R.drawable.ic_touch, "Modo móvil: tocar directo y más zoom", ::setMobile))
             add(IconButton(this@MainActivity, R.drawable.ic_workspace, "Workspaces", ::askWorkspaces))
@@ -206,33 +212,27 @@ class MainActivity : Activity() {
         pad = PadView(this).apply {
             contentDescription = "Área táctil"
             absolute = { mobile && video.visibility == View.VISIBLE }
-            absRect = { android.graphics.Rect(video.left, video.top, video.right, video.bottom) }
+            absRect = ::videoRect
+            onViewport = { scaleFactor, dx, dy ->
+                zoom = (zoom * scaleFactor).coerceIn(1f, ZOOM_MAX)
+                applyZoom(dx, dy)
+            }
+            onAbsTap = { nx, ny ->
+                lastTapX = nx.coerceIn(0f, 1f)
+                lastTapY = ny.coerceIn(0f, 1f)
+            }
             setBackgroundColor(0) // el fondo y la guia viven en el stage, debajo
             // Franjas = lo que el video sin zoom no cubre: izquierda/arriba acerca, derecha/abajo mueve.
             barAt = { x, y ->
-                val fits = video.visibility != View.VISIBLE || (video.width >= stage.width && video.height >= stage.height)
-                if (fits) 0 else if (x < video.left || y < video.top) 1 else if (x > video.right || y > video.bottom) 2 else 0
+                val r = videoRect()
+                val visH = (stage.height - imeH).coerceAtLeast(1)
+                if (video.visibility != View.VISIBLE || (r.width() >= stage.width && r.height() >= visH)) 0
+                else if (x < r.left || y < r.top) 1 else if (x > r.right || y > r.bottom) 2 else 0
             }
             onBar = { mode, dx, dy ->
                 if (mode == 1) zoom = (zoom * kotlin.math.exp(-dy / (ZOOM_DP * dp))).coerceIn(1f, ZOOM_MAX)
                 applyZoom(if (mode == 2) dx else 0f, if (mode == 2) dy else 0f)
             }
-        }
-        video = SurfaceView(this).apply {
-            visibility = View.GONE
-            holder.addCallback(object : SurfaceHolder.Callback {
-                override fun surfaceCreated(h: SurfaceHolder) {
-                    surfaceReady = true
-                    syncScreen()
-                }
-
-                override fun surfaceChanged(h: SurfaceHolder, format: Int, width: Int, height: Int) {}
-
-                override fun surfaceDestroyed(h: SurfaceHolder) {
-                    surfaceReady = false
-                    syncScreen()
-                }
-            })
         }
         video = SurfaceView(this).apply {
             visibility = View.GONE
@@ -311,7 +311,13 @@ class MainActivity : Activity() {
             val h = insets.getInsets(WindowInsets.Type.ime()).bottom
             if (h != imeH) {
                 imeH = h
+                if (h > 0) imeWasOpen = true
+                else if (imeWasOpen) {
+                    imeWasOpen = false
+                    if (keyboardToggle.isOn) keyboardToggle.isOn = false
+                }
                 fitVideo()
+                if (h > 0 && zoom > 1f) focusTapAboveKeyboard()
                 // El monitor del telefono se encoge a lo que queda visible sobre el teclado: las
                 // ventanas se reacomodan ahi y se ve completo lo que se escribe, sin zoom.
                 stage.removeCallbacks(resize)
@@ -345,6 +351,14 @@ class MainActivity : Activity() {
     /** Modo movil: toque directo sobre el video y monitor con mas zoom. Modo mouse: todo relativo. */
     private fun setMobile(on: Boolean) {
         mobile = on
+        if (on) {
+            autoZoomPending = true
+            maybeAutoZoom()
+        } else {
+            autoZoomPending = false
+            zoom = 1f
+            applyZoom(0f, 0f)
+        }
         link?.sendText(SET_SCALE + (if (on) MOBILE_SCALE else 0) + ";")
         stage.removeCallbacks(resize)
         stage.postDelayed(resize, SCALE_SETTLE_MS)
@@ -396,7 +410,10 @@ class MainActivity : Activity() {
             height = (vh * k).toInt()
             gravity = if (imeH > 0) Gravity.TOP or Gravity.CENTER_HORIZONTAL else Gravity.CENTER
         }
-        video.post { applyZoom(0f, 0f) }
+        video.post {
+            if (autoZoomPending) maybeAutoZoom() else applyZoom(0f, 0f)
+            if (imeH > 0 && zoom > 1f) focusTapAboveKeyboard()
+        }
     }
 
     private var wsDialog: android.app.Dialog? = null
@@ -419,13 +436,57 @@ class MainActivity : Activity() {
         )
     }
 
+    private fun videoRect(): android.graphics.Rect {
+        val cx = (video.left + video.right) / 2f + video.translationX
+        val cy = (video.top + video.bottom) / 2f + video.translationY
+        val hw = video.width * video.scaleX / 2f
+        val hh = video.height * video.scaleY / 2f
+        return android.graphics.Rect((cx - hw).toInt(), (cy - hh).toInt(), (cx + hw).toInt(), (cy + hh).toInt())
+    }
+
+    private fun maybeAutoZoom() {
+        if (!mobile || video.visibility != View.VISIBLE || vw <= 0 || vh <= 0 || video.height <= 0) return
+        if (stage.width >= stage.height || vw <= vh || zoom > 1.05f) return
+        val target = minOf((stage.height - imeH).coerceAtLeast(1).toFloat() / video.height.toFloat(), 2.2f).coerceIn(1.5f, 2.2f)
+        zoom = target
+        applyZoom(0f, 0f)
+        autoZoomPending = false
+    }
+
+    private fun focusTapAboveKeyboard() {
+        if (video.width <= 0 || video.height <= 0 || zoom <= 1f) return
+        val visH = (stage.height - imeH).coerceAtLeast(1).toFloat()
+        val cy = (video.top + video.bottom) / 2f
+        video.translationX = (0.5f - lastTapX) * video.width * zoom
+        video.translationY = (visH / 2f - cy) + (0.5f - lastTapY) * video.height * zoom
+        applyZoom(0f, 0f)
+    }
+
     private fun applyZoom(dx: Float, dy: Float) {
-        val mx = (zoom - 1) * video.width / 2
-        val my = (zoom - 1) * video.height / 2
         video.scaleX = zoom
         video.scaleY = zoom
-        video.translationX = (video.translationX + dx).coerceIn(-mx, mx)
-        video.translationY = (video.translationY + dy).coerceIn(-my, my)
+        if (video.width <= 0 || video.height <= 0 || zoom <= 1f) {
+            video.translationX = 0f
+            video.translationY = 0f
+            return
+        }
+        val visH = (stage.height - imeH).coerceAtLeast(1).toFloat()
+        val maxX = ((video.width * zoom - stage.width) / 2f).coerceAtLeast(0f)
+        val scaledH = video.height * zoom
+        val cy = (video.top + video.bottom) / 2f
+        val minY: Float
+        val maxY: Float
+        if (scaledH <= visH) {
+            // Con el teclado abierto y Gravity.TOP, evita recortar la parte superior del video al escalar.
+            val baseY = if (imeH > 0) scaledH / 2f - cy else 0f
+            minY = baseY
+            maxY = baseY
+        } else {
+            minY = visH - scaledH / 2f - cy
+            maxY = scaledH / 2f - cy
+        }
+        video.translationX = (video.translationX + dx).coerceIn(-maxX, maxX)
+        video.translationY = (video.translationY + dy).coerceIn(minY, maxY)
     }
 
     private fun showScreen(on: Boolean) {
@@ -499,6 +560,7 @@ class MainActivity : Activity() {
             macs = { prefs.getStringSet("macs", emptySet()).orEmpty() },
             onClip = { text -> runOnUiThread { if (link === l) setPhoneClipboard(text) } },
             onMac = { mac -> prefs.edit().putStringSet("macs", prefs.getStringSet("macs", emptySet()).orEmpty() + mac).apply() },
+            onIme = { open -> runOnUiThread { if (link === l && open && !keyboardToggle.isOn) keyboardToggle.isOn = true } },
         ) { connected -> runOnUiThread { if (link === l) showStatus(connected) } }
         link = l
         pad.link = l

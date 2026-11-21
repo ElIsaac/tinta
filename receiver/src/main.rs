@@ -1,9 +1,13 @@
 mod clip;
 mod engine;
+mod input;
+#[cfg(target_os = "macos")]
+mod macos;
 mod proto;
 mod status;
 mod stream;
 mod text;
+#[cfg(target_os = "linux")]
 mod uinput;
 mod ws;
 
@@ -21,14 +25,15 @@ type Res<T> = Result<T, Box<dyn Error>>;
 
 const FAILSAFE: Duration = Duration::from_millis(500);
 const USAGE: &str = "\
-spenmouse-receiver [--port N] [--sensitivity F] [--screen virtual|focused|NAME] [--scale F] [--dry-run]
+spenmouse-receiver [--port N] [--sensitivity F] [--screen virtual|focused|window|NAME] [--scale F] [--dry-run]
 spenmouse-receiver pair [--port N] [--host IPV4] [--alt IPV4]...
 
   --port N         UDP port, and TCP port of the video stream (default 47800)
   --sensitivity F  finger movement, mouse counts per mm (default 20)
   --screen WHAT    what the phone shows: `virtual` (default) = a third monitor with the phone's
                    size, alive while the phone streams; `focused` = mirror the focused
-                   monitor; NAME = mirror that output
+                   monitor; `window` = mirror and adapt a single window to the phone (macOS);
+                   NAME = mirror that output
   --scale F        scale of the virtual monitor (default 1.5)
   --dry-run        print events and text instead of injecting them (/dev/uinput, wtype)
   --host IPV4      address to put in the pairing URI (default: default-route interface)
@@ -68,6 +73,20 @@ fn hex(b: &[u8]) -> String {
     b.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+fn hostname() -> String {
+    let mut buf = [0u8; 256];
+    // SAFETY: buf is valid writable storage of length 256.
+    if unsafe { libc::gethostname(buf.as_mut_ptr().cast::<libc::c_char>(), buf.len()) } != 0 {
+        return String::new();
+    }
+    let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    String::from_utf8_lossy(&buf[..len])
+        .trim()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '-' })
+        .collect()
+}
+
 fn pair(port: u16, host: Option<String>, alts: Vec<String>) -> Res<()> {
     let key = load_or_create_key()?;
     let host = match host {
@@ -79,12 +98,7 @@ fn pair(port: u16, host: Option<String>, alts: Vec<String>) -> Res<()> {
             s.local_addr()?.ip().to_string()
         }
     };
-    let name: String = fs::read_to_string("/proc/sys/kernel/hostname")
-        .unwrap_or_default()
-        .trim()
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '-' })
-        .collect();
+    let name = hostname();
     let mut uri = format!("spenmouse://pair?host={host}&port={port}&key={}&name={name}", hex(&key));
     // other addresses of this laptop (VPN, another network): the phone tries them all
     for a in &alts {
@@ -107,7 +121,7 @@ fn pair(port: u16, host: Option<String>, alts: Vec<String>) -> Res<()> {
 
 enum Sink {
     Dry,
-    Real { mouse: File, tablet: Option<File>, touch: Option<File> },
+    Real { mouse: input::Mouse, tablet: Option<input::Tablet>, touch: Option<input::Touch> },
 }
 
 impl Sink {
@@ -126,13 +140,13 @@ impl Sink {
             }
             Sink::Real { mouse: m, tablet: t, touch: th } => {
                 if let (true, Some(t)) = (tablet.n > 0, t) {
-                    uinput::write(t, tablet)?;
+                    input::write_tablet(t, tablet)?;
                 }
                 if let (true, Some(th)) = (touch.n > 0, th) {
-                    uinput::write(th, touch)?;
+                    input::write_touch(th, touch)?;
                 }
                 if mouse.n > 0 {
-                    uinput::write(m, mouse)?;
+                    input::write_mouse(m, mouse)?;
                 }
             }
         }
@@ -180,12 +194,79 @@ fn exit_on_signal(streams: Arc<stream::Streams>) {
 }
 
 /// MAC of the interface that owns this local address.
+#[cfg(target_os = "linux")]
 fn mac_of_local(ip: std::net::Ipv4Addr) -> Option<String> {
     let out = std::process::Command::new("ip").args(["-o", "-4", "addr", "show"]).output().ok()?;
     let txt = String::from_utf8_lossy(&out.stdout).into_owned();
     // "3: wlp0s20f3    inet 192.168.0.28/24 brd ..."
     let dev = txt.lines().find(|l| l.contains(&format!("inet {ip}/")))?.split_whitespace().nth(1)?.to_string();
     Some(fs::read_to_string(format!("/sys/class/net/{dev}/address")).ok()?.trim().to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn mac_of_local(ip: std::net::Ipv4Addr) -> Option<String> {
+    struct IfAddrs(*mut libc::ifaddrs);
+    impl Drop for IfAddrs {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe { libc::freeifaddrs(self.0) };
+            }
+        }
+    }
+
+    let mut raw: *mut libc::ifaddrs = std::ptr::null_mut();
+    if unsafe { libc::getifaddrs(&mut raw) } != 0 || raw.is_null() {
+        return None;
+    }
+    let guard = IfAddrs(raw);
+
+    let mut if_name: Option<Vec<u8>> = None;
+    let mut cur = guard.0;
+    while !cur.is_null() {
+        // SAFETY: node in getifaddrs linked list is valid until freeifaddrs on drop.
+        let ifa = unsafe { &*cur };
+        if !ifa.ifa_addr.is_null() && !ifa.ifa_name.is_null() {
+            let family = unsafe { (*ifa.ifa_addr).sa_family as i32 };
+            if family == libc::AF_INET {
+                let sin = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_in) };
+                let addr = std::net::Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
+                if addr == ip {
+                    let name = unsafe { std::ffi::CStr::from_ptr(ifa.ifa_name) };
+                    if_name = Some(name.to_bytes().to_vec());
+                    break;
+                }
+            }
+        }
+        cur = ifa.ifa_next;
+    }
+    let target = if_name?;
+
+    let mut cur = guard.0;
+    while !cur.is_null() {
+        let ifa = unsafe { &*cur };
+        if !ifa.ifa_addr.is_null() && !ifa.ifa_name.is_null() {
+            let family = unsafe { (*ifa.ifa_addr).sa_family as i32 };
+            if family == libc::AF_LINK {
+                let name = unsafe { std::ffi::CStr::from_ptr(ifa.ifa_name) };
+                if name.to_bytes() == target.as_slice() {
+                    let sdl = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_dl) };
+                    if sdl.sdl_alen == 6 {
+                        let data_off = (sdl.sdl_data.as_ptr() as usize) - (sdl as *const _ as usize);
+                        if (sdl.sdl_len as usize) >= data_off + sdl.sdl_nlen as usize + 6 {
+                            let ptr = unsafe { (sdl.sdl_data.as_ptr() as *const u8).add(sdl.sdl_nlen as usize) };
+                            let m = unsafe { std::slice::from_raw_parts(ptr, 6) };
+                            return Some(format!(
+                                "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                                m[0], m[1], m[2], m[3], m[4], m[5]
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        cur = ifa.ifa_next;
+    }
+    None
 }
 
 /// Nonce counter of WSLIST packets: never repeats within a session.
@@ -195,6 +276,7 @@ fn next_ws_seq() -> u32 {
 }
 
 /// MAC of the interface that routes to `ip`: the one a magic packet from there must carry.
+#[cfg(target_os = "linux")]
 fn mac_towards(ip: std::net::IpAddr) -> Option<String> {
     let out = std::process::Command::new("ip").args(["-o", "route", "get", &ip.to_string()]).output().ok()?;
     let route = String::from_utf8_lossy(&out.stdout).into_owned();
@@ -202,13 +284,27 @@ fn mac_towards(ip: std::net::IpAddr) -> Option<String> {
     Some(fs::read_to_string(format!("/sys/class/net/{dev}/address")).ok()?.trim().to_string())
 }
 
+#[cfg(target_os = "macos")]
+fn mac_towards(ip: std::net::IpAddr) -> Option<String> {
+    let std::net::IpAddr::V4(v4) = ip else { return None };
+    let s = UdpSocket::bind("0.0.0.0:0").ok()?;
+    s.connect((v4, 9)).ok()?;
+    let std::net::SocketAddr::V4(local) = s.local_addr().ok()? else { return None };
+    mac_of_local(*local.ip())
+}
+
 fn run(port: u16, sens: f32, dry: bool, screen: stream::Screen, scale: String) -> Res<()> {
     let key = load_or_create_key()?;
     let mut sink = if dry {
         Sink::Dry
     } else {
-        let mouse = uinput::mouse().map_err(|e| {
-            format!("/dev/uinput: {e} (needs write access for your user, or use --dry-run)")
+        #[cfg(target_os = "macos")]
+        macos::check_permissions();
+        let mouse = input::mouse().map_err(|e| {
+            #[cfg(target_os = "linux")]
+            { format!("/dev/uinput: {e} (needs write access for your user, or use --dry-run)") }
+            #[cfg(not(target_os = "linux"))]
+            { format!("input: {e}") }
         })?;
         Sink::Real { mouse, tablet: None, touch: None }
     };
@@ -228,7 +324,7 @@ fn run(port: u16, sens: f32, dry: bool, screen: stream::Screen, scale: String) -
     // wtype runs in its own thread, one text at a time: order kept, pointer never waits
     let (typist, texts) = mpsc::channel::<String>();
     let seen = Arc::new(Mutex::new(Instant::now())); // last valid HELLO
-    let kbd = if dry { None } else { Some(uinput::keyboard()?) };
+    let kbd = if dry { None } else { Some(input::keyboard()?) };
     let seen_typist = seen.clone();
     std::thread::spawn(move || {
         let mut typist = text::Typist::new(kbd);
@@ -276,6 +372,10 @@ fn run(port: u16, sens: f32, dry: bool, screen: stream::Screen, scale: String) -
     let mut last_accept = Instant::now();
     let mut armed = false; // socket has a read timeout that ends at last_accept + FAILSAFE
     let mut buf = [0u8; proto::TEXT_MAX + 1]; // +1: an oversized datagram shows as a bad length
+    #[cfg(target_os = "macos")]
+    let ime_gen = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    #[cfg(target_os = "macos")]
+    let ime_sock = Arc::new(sock.try_clone()?);
 
     loop {
         let (mut tf, mut mf) = (Frame::default(), Frame::default());
@@ -305,9 +405,9 @@ fn run(port: u16, sens: f32, dry: bool, screen: stream::Screen, scale: String) -
                             Sink::Dry => println!("create tablet res={rx}x{ry}"),
                             Sink::Real { tablet, touch, .. } => {
                                 *tablet = None; // destroy the old one first
-                                *tablet = Some(uinput::tablet(rx, ry)?);
+                                *tablet = Some(input::tablet(rx, ry)?);
                                 *touch = None;
-                                *touch = Some(uinput::touch(rx, ry)?);
+                                *touch = Some(input::touch(rx, ry)?);
                             }
                         }
                         eprintln!(
@@ -370,6 +470,39 @@ fn run(port: u16, sens: f32, dry: bool, screen: stream::Screen, scale: String) -
         }
         let touchf = std::mem::take(&mut engine.touchf);
         sink.frames(&tf, &mf, &touchf)?;
+        #[cfg(target_os = "macos")]
+        if !dry {
+            use engine::{BTN_LEFT, BTN_TOUCH, EV_KEY};
+            let released = mf
+                .events()
+                .iter()
+                .any(|e| e.kind == EV_KEY && e.code == BTN_LEFT && e.value == 0)
+                || tf
+                    .events()
+                    .iter()
+                    .chain(touchf.events())
+                    .any(|e| e.kind == EV_KEY && e.code == BTN_TOUCH && e.value == 0);
+            let session = engine.session();
+            if released && session != 0 {
+                if let Some(to) = *phone_addr.lock().unwrap() {
+                    let gen = ime_gen
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                        .wrapping_add(1);
+                    let (gen_ref, out, kws) = (ime_gen.clone(), ime_sock.clone(), kws.clone());
+                    std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_millis(120));
+                        if gen_ref.load(std::sync::atomic::Ordering::SeqCst) == gen
+                            && macos::focused_is_text_input()
+                        {
+                            let _ = out.send_to(
+                                &proto::wslist(&kws, next_ws_seq(), session, "ime\t1\n"),
+                                to,
+                            );
+                        }
+                    });
+                }
+            }
+        }
 
         // Read timeout only while something is held; setsockopt only on transitions
         // or after a non-accepted wakeup, never per accepted packet.
@@ -411,6 +544,8 @@ fn main() {
                 screen = match val() {
                     v if v == "virtual" => stream::Screen::Virtual,
                     v if v == "focused" => stream::Screen::Focused,
+                    #[cfg(target_os = "macos")]
+                    v if v == "window" => stream::Screen::Window,
                     v => stream::Screen::Named(v),
                 }
             }
