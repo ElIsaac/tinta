@@ -33,8 +33,14 @@ class PadView(context: Context) : View(context) {
     /** Modo movil: el dedo y el lapiz apuntan donde tocan, dentro de [absRect] (el video). */
     var absolute: () -> Boolean = { false }
     var absRect: () -> android.graphics.Rect? = { null }
+    var onViewport: ((scaleFactor: Float, dx: Float, dy: Float) -> Unit)? = null
+    var onAbsTap: ((xNorm: Float, yNorm: Float) -> Unit)? = null
     private var absLive = false
     private var absLong = false
+    private var pinchDist = 0f
+    private var pinchMidX = 0f
+    private var pinchMidY = 0f
+    private var absPinching = false
     private val mobileStep = MOBILE_STEP_DP * resources.displayMetrics.density
     private val absRelease = Runnable {
         btn = btn and BTN_LEFT.inv()
@@ -214,7 +220,10 @@ class PadView(context: Context) : View(context) {
         penButton(e.buttonState and PEN_BUTTONS != 0)
         // En modo movil el lapiz es una tableta absoluta: la punta ya hace clic, no se suma BTN_LEFT.
         val abs = absolute() && setAbs(e.x, e.y)
-        if (abs) f = f or PEN_ABS
+        if (abs) {
+            f = f or PEN_ABS
+            if (e.actionMasked == MotionEvent.ACTION_DOWN) onAbsTap?.invoke(x / 65535f, y / 65535f)
+        }
         penTip(f and CONTACT != 0 && !abs)
         tool = f
         if (!abs) setXY(e.x, e.y)
@@ -247,6 +256,12 @@ class PadView(context: Context) : View(context) {
 
     private fun avgY(e: MotionEvent) = (e.getY(0) + e.getY(1)) / 2
 
+    private fun span(e: MotionEvent) = hypot(e.getX(0) - e.getX(1), e.getY(0) - e.getY(1))
+
+    private fun midX(e: MotionEvent) = (e.getX(0) + e.getX(1)) / 2f
+
+    private fun midY(e: MotionEvent) = (e.getY(0) + e.getY(1)) / 2f
+
     private fun finger(e: MotionEvent) {
         val a = e.actionMasked
         if (a == MotionEvent.ACTION_DOWN) barMode = barAt?.invoke(e.x, e.y) ?: 0
@@ -274,17 +289,43 @@ class PadView(context: Context) : View(context) {
                     moved = false
                     absLong = false
                     absTwo = false
+                    absPinching = false
                     tool = IN_RANGE or TOOL_PEN or PEN_ABS // como un lapiz flotando: mueve el cursor sin tocar
                     pressure = 0
                     postDelayed(longPress, LONG_PRESS_MS)
                 }
-                MotionEvent.ACTION_POINTER_DOWN -> { // segundo dedo: sera un clic derecho si no hay arrastre
+                MotionEvent.ACTION_POINTER_DOWN -> { // segundo dedo: clic derecho al soltar o pellizco/paneo al mover
                     removeCallbacks(longPress)
                     if (absLong) return
-                    absTwo = true
+                    if (e.pointerCount >= 2) {
+                        absTwo = true
+                        absPinching = false
+                        pinchDist = span(e)
+                        pinchMidX = midX(e)
+                        pinchMidY = midY(e)
+                    }
                     return
                 }
                 MotionEvent.ACTION_MOVE -> {
+                    if (absTwo && e.pointerCount >= 2) {
+                        val d = span(e)
+                        val mx = midX(e)
+                        val my = midY(e)
+                        if (!absPinching && (abs(d - pinchDist) > slop || hypot(mx - pinchMidX, my - pinchMidY) > slop)) {
+                            absPinching = true
+                            moved = true
+                        }
+                        if (absPinching) {
+                            val scaleFactor = if (pinchDist > 1f) (d / pinchDist).coerceIn(0.8f, 1.25f) else 1f
+                            val dx = mx - pinchMidX
+                            val dy = my - pinchMidY
+                            pinchDist = d
+                            pinchMidX = mx
+                            pinchMidY = my
+                            onViewport?.invoke(scaleFactor, dx, dy)
+                        }
+                        return
+                    }
                     if (!moved && hypot(e.x - downX, e.y - downY) > slop) {
                         moved = true
                         removeCallbacks(longPress)
@@ -304,6 +345,7 @@ class PadView(context: Context) : View(context) {
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                     removeCallbacks(longPress)
                     absLive = false
+                    absPinching = false
                     val up = a == MotionEvent.ACTION_UP
                     when {
                         absLong -> { // fin de la seleccion; sin arrastre, doble clic para tomar la palabra
@@ -318,7 +360,8 @@ class PadView(context: Context) : View(context) {
                             postDelayed(rightRelease, CLICK_MS)
                             tool = 0
                         }
-                        up && !moved -> {
+                        up && !moved && !absTwo -> {
+                            onAbsTap?.invoke(x / 65535f, y / 65535f)
                             btn = btn or BTN_LEFT
                             postDelayed(absRelease, CLICK_MS)
                         }
