@@ -40,6 +40,7 @@ fun clearText() = synchronized(TEXT) {
 private const val WOL_PORT = 9
 private const val MAC_PREFIX = "mac\t"
 private const val CLIP_PREFIX = "clip\t"
+private const val IME_PREFIX = "ime\t"
 private const val ASK_MAC = "\uE025"
 
 /** Paquete magico de Wake-on-LAN: 6 x FF y la MAC 16 veces. null si la MAC no es valida. */
@@ -55,6 +56,7 @@ class Link(
     private val macs: () -> Collection<String> = { emptyList() },
     private val onMac: ((String) -> Unit)? = null, // null = no preguntar la MAC
     private val onClip: ((String) -> Unit)? = null, // portapapeles de la laptop
+    private val onIme: ((Boolean) -> Unit)? = null, // teclado automatico al enfocar un campo
     private val onConnected: (Boolean) -> Unit,
 ) {
     private val lock = Object()
@@ -284,6 +286,7 @@ class Link(
             if (list != null) {
                 when {
                     list.startsWith(MAC_PREFIX) -> onMac?.invoke(list.removePrefix(MAC_PREFIX).trim())
+                    list.startsWith(IME_PREFIX) -> onIme?.invoke(list.removePrefix(IME_PREFIX).trim() == "1")
                     list.startsWith(CLIP_PREFIX) -> {
                         // clip TAB k TAB n TAB trozo: se arma cuando llegan los n en orden
                         val f = list.split('\t', limit = 4)
